@@ -16,26 +16,64 @@ log_levels = mozlog.structuredlog.log_levels
 levels_by_number = {v:k for k,v in log_levels.iteritems()}
 
 class ErrorLine(object):
-    def __init__(self, data):
-        self.row_id = None
-        self.data = data
-        self.matches = []
-        self.autostar_id = None
+    def __init__(self, id, action, line, test=None, subtest=None, status=None, expected=None,
+                 message=None, stack=None, signature=None, stackwalk_stdout=None,
+                 stackwalk_stderr=None, level=None, autostar_id=None, job_id=None):
+        self.id = id
+        self.action = actions_by_number[action]
+        self.line = line
+        self.test = test
+        self.subtest = subtest
+        self.status = status
+        self.expected = expected
+        self.message = message
+        self.stack = stack
+        self.signature = signature
+        self.stackwalk_stdout = stackwalk_stdout
+        self.stackwalk_stderr = stackwalk_stderr
+        self.level = levels_by_number[level] if level is not None else None
+        self.autostar_id = autostar_id
+        self.job_id = job_id
 
     def __str__(self):
-        return repr(self.data)
+        attrs = self.__dict__
+        return "ErrorLine: %s (%s)" % (self.action, repr({k:v for k,v in attrs.iteritems()
+                                                          if v is not None}))
+
+    def as_dict(self):
+        pass
+
+    def set(self, conn, attr, value):
+        if attr == "action":
+            db_value = actions[value]
+        elif attr == "level":
+            db_value = log_levels[level]
+        else:
+            db_value = value
+
+        assert hasattr(self, attr)
+        c = conn.cursor()
+        c.execute("""UPDATE errors SET %s = ? WHERE id = ?""" % attr, (db_value, self.id))
+        setattr(self, attr, value)
+        conn.commit()
 
 class Job(object):
-    def __init__(self, data):
-        self.row_id = None
-        self.data = data
-        self.success = None
-        self.error_url = None
+    def __init__(self, id, job_type, ref_data_name, result, errors_processed, result_set_id):
+        self.id = id
+        self.job_type = job_type
+        self.ref_data_name = ref_data_name
+        self.result = result
+        self.errors_processed = errors_processed
+        self.result_set_id = result_set_id
         self.error_lines = []
 
-    @property
-    def id(self):
-        return self.data['id']
+    def set(self, conn, attr, value):
+        assert hasattr(self, attr)
+        c = conn.cursor()
+        c.execute("""UPDATE errors SET %s = ? WHERE id = ?""" % attr, (value, self.id))
+        setattr(self, attr, value)
+        conn.commit()
+
 
 def setup_database(conn, repo, revision):
     c = conn.cursor()
@@ -44,7 +82,7 @@ def setup_database(conn, repo, revision):
     (id integer primary key, sha1 text)""")
 
     c.execute("""CREATE TABLE jobs
-    (id integer primary key, errors_processed integer)""")
+    (id integer primary key, job_type text, ref_data_name text, result text, errors_processed int, result_set_id int)""")
 
     c.execute("""CREATE TABLE errors
     (id integer primary key autoincrement, action integer, line integer, test text, subtest text, status text, expected text, message text, stack text, signature text, stackwalk_stdout text, stackwalk_stderr text, level integer, autostar_id integer, job_id integer)""")
@@ -73,39 +111,88 @@ def get_meta(conn):
     return repo, last_rev
 
 
-def get_result_sets(client, repository, last_rev):
-    # Just assume there are < 100 changes for now
-    if repository == "try":
-        count = 1
-        params = {"revision": last_rev}
+def get_result_sets(client, repository, revisions, load_from):
+    if load_from:
+        assert len(revisions) == 1
+        return client.get_resultsets(repository, count=None, fromchange=revisions[0])
     else:
-        count = 100
-        params = {"fromchange": last_rev}
-    return client.get_resultsets(repository, count=count, **params)
-
+        rv = []
+        for revision in revisions:
+            rv += client.get_resultsets(repository, count=1, revision=revision)
+        return rv
 
 def get_jobs(client, repository, result_set):
     return client.get_jobs(repository, result_set_id=result_set['id'], count=None)
 
+def get_finished_jobs(client, repository, result_set):
+    return [item for item in get_jobs(client, repository, result_set)
+            if item["state"] == "completed"]
 
-def insert_jobs(conn, jobs):
+def get_new_jobs(conn, jobs):
+    c = conn.cursor()
+    job_ids = [item["id"] for item in jobs]
+    query = """SELECT id FROM jobs WHERE id IN (%s)""" % ("?," * (len(jobs) - 1) + "?")
+    c.execute(query, tuple(item["id"] for item in jobs))
+    existing_jobs = set(item[0] for item in c.fetchall())
+    return [item for item in jobs if item["id"] not in existing_jobs]
+
+
+def insert_errors(conn, job_id, error_lines):
+    c = conn.cursor()
+    for line in error_lines:
+        c.execute("""INSERT INTO errors (action, line, test, subtest, status, expected, message, stack, signature, stackwalk_stdout, stackwalk_stderr, level, job_id)
+                     VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                  (actions[line["action"]], line["line"], line.get("test"),
+                   line.get("subtest"), line.get("status"), line.get("expected"),
+                   line.get("message"), line.get("stack"), line.get("signature"),
+                   line.get("stackwalk_stdout"), line.get("stackwalk_stderr"),
+                   log_levels.get(line.get("level")), job_id))
+    conn.commit()
+
+
+def insert_jobs(conn, result_set_id, jobs, error_lines_by_job):
     rv= []
     c = conn.cursor()
     for job in jobs:
-        c.execute("""INSERT OR IGNORE INTO jobs (id, errors_processed) VALUES (?, ?)""",
-                  (job.id, 0))
-        job.row_id = c.lastrowid
+        c.execute("""INSERT OR IGNORE INTO jobs (id, job_type, ref_data_name, result,
+                                                 errors_processed, result_set_id)
+                    VALUES (?, ?, ?, ?, 0, ?)""",
+                  (job["id"], job["job_type_name"], job["ref_data_name"], job["result"],
+                   result_set_id))
+        if job["id"] in error_lines_by_job:
+            insert_errors(conn, job["id"], error_lines_by_job[job["id"]])
+
     conn.commit()
     return rv
 
 
 def job_has_errors(job):
-    return job.data["result"] in ["testfailed", "busted"]
+    return job["result"] in ["testfailed", "busted"]
 
 
 def get_artifacts(client, repository, job):
-    return client.get_artifacts(project=repository, job_id=job.id,
+    return client.get_artifacts(project=repository, job_id=job["id"],
                                 name="Job Info")
+
+def get_error_urls(client, repository, jobs):
+    rv = {}
+    for job in jobs:
+        if job_has_errors(job):
+            artifacts = get_artifacts(client, repository, job)
+            error_url = get_error_url(artifacts)
+            if error_url:
+                rv[job["id"]] = error_url
+    return rv
+
+
+def fetch_summary(url):
+    resp = requests.get(url)
+    resp.raise_for_status()
+    return [json.loads(line) for line in resp.iter_lines()]
+
+
+def get_error_lines(client, error_urls):
+    return {key:fetch_summary(url) for key,url in error_urls.iteritems()}
 
 
 def get_error_url(artifacts):
@@ -121,98 +208,88 @@ def get_error_url(artifacts):
                 return item["url"]
 
 
-def get_jobs_by_type(client, repository, result_set):
-    """Return a dictionary of {job name: [(job_data, error_url)]} for all jobs in
-    a result set"""
-    rv = defaultdict(list)
-    jobs = get_jobs(client, repository, result_set)
-    logger.debug("Found %i jobs" % len(jobs))
-    for job_data in jobs:
-        job = Job(job_data)
-        logger.debug("Loading job %s %s %s" % (job.id, job.data["ref_data_name"], job.data["result"]))
-        if job_has_errors(job):
-            artifacts = get_artifacts(client, repository, job)
-            # if job.data["build_system_type"] == "buildbot":
-            #     import pdb
-            #     pdb.set_trace()
-            job.error_url = get_error_url(artifacts)
+def dict_from_query(description, data):
+    keys = (item[0] for item in description)
+    return {key:value for key, value in zip(keys, data)}
 
-        rv[job_data["ref_data_name"]].append(job)
+
+def load_jobs(conn, result_set_id):
+    c = conn.cursor()
+    c.execute("""SELECT * from jobs WHERE result_set_id = ?""", (result_set_id,))
+    cols = c.description
+    rv = []
+    for row in c.fetchall():
+        job = Job(**dict_from_query(cols, row))
+        c1 = conn.cursor()
+        c1.execute("""SELECT * FROM errors WHERE job_id = ?""", (job.id,))
+        error_cols = c1.description
+        error_lines = c1.fetchall()
+        if error_lines:
+            lines = []
+            for error_line in error_lines:
+                lines.append(ErrorLine(**dict_from_query(error_cols, error_line)))
+            job.error_lines = lines
+        rv.append(job)
 
     return rv
 
-
-def fetch_summary(url):
-    resp = requests.get(url)
-    resp.raise_for_status()
-    for line in resp.iter_lines():
-        yield json.loads(line)
-
-
-def update_meta(conn, last_rev):
-    pass
+def by_ref_type(jobs):
+    rv = defaultdict(list)
+    for item in jobs:
+        rv[item.ref_data_name].append(item)
+    return rv
 
 
-class Matcher(object):
-    def __init__(self, conn):
-        self.conn = conn
+def precise_test_matcher(conn, error_lines):
+    c = conn.cursor()
+    for error_line in error_lines:
+        logger.debug("Looking for test match on line %s" % error_line[0])
+        line = error_line[0]
 
-    def __call__(self, error_line):
-        pass
+        if line.action == "test_result":
+            query = """SELECT autostar_id FROM errors WHERE
+            action = ? AND test = ? AND status = ? AND
+            expected = ? AND autostar_id IS NOT NULL"""
+            params = [actions[line.action], line.test,
+                      line.status, line.expected]
 
+            for maybe_null in ["subtest", "message", "stack"]:
+                value = getattr(line, maybe_null)
+                if value is None:
+                    query += " AND %s IS NULL" % maybe_null
+                else:
+                    query += " AND %s = ?" % maybe_null
+                    params.append(value)
 
-class PreciseTestMatcher(Matcher):
-    def __call__(self, error_lines):
-        c = self.conn.cursor()
-        for error_line in error_lines:
-            logger.debug("Looking for test match on line %s" % error_line)
-            line = error_line.data
+            query += " GROUP BY autostar_id"
+            c.execute(query, tuple(params))
 
-            if line["action"] == "test_result":
-                query = """SELECT autostar_id FROM errors WHERE
-                action = ? AND test = ? AND status = ? AND
-                expected = ? AND autostar_id IS NOT NULL"""
-                params = [actions[line["action"]], line["test"],
-                          line["status"], line["expected"]]
+            rows = c.fetchall()
 
-                for maybe_null in ["subtest", "message", "stack"]:
-                    value = line.get(maybe_null)
-                    if value is None:
-                        query += " AND %s IS NULL" % maybe_null
-                    else:
-                        query += " AND %s = ?" % maybe_null
-                        params.append(value)
+            logger.debug("Found %i matching rows" % len(rows))
 
-                query += " GROUP BY autostar_id"
-                c.execute(query, tuple(params))
-
-                rows = c.fetchall()
-
-                logger.debug("Found %i matching rows" % len(rows))
-
-                assert len(rows) <= 1, "Need to fix the case where we have more than one exact match for a test failure"
-                if rows:
-                    logger.info("PreciseTestMatcher matched line %s" % error_line)
-                    error_line.matches.append((rows[0][0], 1))
+            assert len(rows) <= 1, "Need to fix the case where we have more than one exact match for a test failure"
+            if rows:
+                logger.info("PreciseTestMatcher matched line %s" % error_line[0])
+                error_line[1].append((rows[0][0], 1))
 
 
-class PreciseLogMatcher(Matcher):
-    def __call__(self, error_lines):
-        c = self.conn.cursor()
-        for error_line in error_lines:
-            line = error_line.data
-            if line["action"] == "log":
-                c.execute("""SELECT autostar_id FROM errors WHERE
-                action = ? AND level = ? AND message = ?
-                GROUP BY autostar_id
-                """,
-                          (actions["log"], line["level"], line.get("message")))
-                rows = c.fetchall()
+def precise_log_matcher(conn, error_lines):
+    c = conn.cursor()
+    for error_line in error_lines:
+        line = error_line[0]
+        if line.action == "log":
+            c.execute("""SELECT autostar_id FROM errors WHERE
+            action = ? AND level = ? AND message = ?
+            GROUP BY autostar_id
+            """,
+                      (actions["log"], line.level, line.message))
+            rows = c.fetchall()
 
-                assert len(rows) <= 1, "Need to fix the case where we have more than one exact match for a log message"
-                if rows:
-                    logger.info("PreciseLogMatcher matched line %s" % error_line)
-                    error_line.matches.append((rows[0][0], 1))
+            assert len(rows) <= 1, "Need to fix the case where we have more than one exact match for a log message"
+            if rows:
+                logger.info("PreciseLogMatcher matched line %s" % error_line)
+                error_line[1].append((rows[0][0], 1))
 
 def get_creators():
     return [test_failure_creator]
@@ -220,83 +297,50 @@ def get_creators():
 def test_failure_creator(error_lines):
     rv = []
     for i, error_line in enumerate(error_lines):
-        if ("test" in error_line.data and "subtest" in error_line.data and
-            "status" in error_line.data and "expected" in error_line.data):
+        if (error_line.test and error_line.status and error_line.expected):
             rv.append(i)
     return rv
 
-def get_job_types_with_errors(client, repository, result_set):
-    jobs_by_type = get_jobs_by_type(client, repository, result_set)
-    rv = {}
-    for key, value in jobs_by_type.iteritems():
-        if any(job.error_url is not None for job in value) is not None:
-            rv[key] = value
-    return rv
+
+def get_matchers():
+    return [precise_test_matcher, precise_log_matcher]
 
 
-def get_matchers(conn):
-    return [PreciseTestMatcher(conn), PreciseLogMatcher(conn)]
-
-
-def get_error_lines(summary_url):
-    #Return a list of (line, [matches]) where [matches] is always empty
-    error_lines = []
-    if summary_url:
-        for error_line in fetch_summary(summary_url):
-            error_lines.append(ErrorLine(error_line))
-    return error_lines
-
-
-def insert_errors(conn, job):
-    c = conn.cursor()
-    rv = []
-    for error_line in job.error_lines:
-        line = error_line.data
-        c.execute("""INSERT INTO errors (action, line, test, subtest, status, expected, message, stack, signature, stackwalk_stdout, stackwalk_stderr, level, job_id)
-        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                  (actions[line["action"]], line["line"], line.get("test"),
-                   line.get("subtest"), line.get("status"), line.get("expected"),
-                   line.get("message"), line.get("stack"), line.get("signature"),
-                   line.get("stackwalk_stdout"), line.get("stackwalk_stderr"),
-                   log_levels.get(line.get("level")), job.id))
-        error_line.row_id = c.lastrowid
-        c.execute("""UPDATE jobs SET errors_processed = 1 WHERE id = ?""", (job.id,))
-    conn.commit()
-
-
-def match_errors(matchers, job):
-    error_lines = [line for line in job.error_lines if not line.autostar_id]
+def match_errors(conn, matchers, job):
+    error_lines = [(line, []) for line in job.error_lines if not line.autostar_id]
     for matcher in matchers:
-        matcher(error_lines)
+        matcher(conn, error_lines)
 
-    for error_line in job.error_lines:
-        best_match_id = get_best_match(error_line)
+    for line, matches in error_lines:
+        best_match_id = get_best_match(matches)
         if best_match_id:
-            error_line.autostar_id = best_match_id
-            logger.info("Got a match for error line %s with autostar id %i" % (error_line, error_line.autostar_id))
+            logger.info("Got a match for error line %s with autostar id %i" %
+                        (line, best_match_id))
+            line.set(conn, "autostar_id", best_match_id)
 
-def get_best_match(error_line):
-    if not error_line.matches:
+
+def get_best_match(matches):
+    if not matches:
         return
 
-    ordered_matches = sorted(error_line.matches[:], key=lambda x:x[1])
+    ordered_matches = sorted(matches[:], key=lambda x:x[1])
     return ordered_matches[-1][0]
 
-def insert_matches(conn, job):
-    c = conn.cursor()
-    for error_line in job.error_lines:
-        # Should make this only update if the autostar id was previous None
-        if error_line.autostar_id:
-            c.execute("""UPDATE errors SET autostar_id = ? WHERE id = ?""",
-                      (error_line.autostar_id, error_line.row_id))
-    conn.commit()
 
 new_matched_tests = set()
 
-def add_new_intermittents(conn, jobs_by_type):
-    all_failed_jobs = [item for item in
-                       reduce(lambda x,y:x+y, jobs_by_type.values(), [])
-                       if not item.success]
+def get_by_type(jobs):
+    rv = defaultdict(list)
+    for item in jobs:
+        rv[item.job_type].append(item)
+    return rv
+
+
+def add_new_intermittents(conn, all_jobs):
+    all_failed_jobs = [item for item in all_jobs if item.error_lines]
+
+    jobs_by_type = get_by_type(all_jobs)
+
     logger.info("Looking for intermittents in %i jobs" % len(all_failed_jobs))
     for type, jobs in jobs_by_type.iteritems():
         # The approach here is currently to look for new intermittents to add, one at a time
@@ -309,13 +353,13 @@ def add_new_intermittents(conn, jobs_by_type):
 
         # For now conservatively assume that we can only mark new intermittents if
         # one run in the current set fully passes
-        if not any(job.success for job in jobs):
+        if not any(job.result == "success" for job in jobs):
             logger.debug("No successful jobs to compare against")
             continue
 
         for i, job in enumerate(jobs):
             logger.debug("Processing job %i" % i)
-            if job.success:
+            if not job.error_lines:
                 continue
 
             found_new_matches = False
@@ -328,30 +372,27 @@ def add_new_intermittents(conn, jobs_by_type):
                 for index in line_indicies:
                     error_line = job.error_lines[index]
                     found_new_matches = True
-                    new_matched_tests.add(error_line.data["test"])
+                    new_matched_tests.add(error_line.test)
                     logger.info("Found new intermittent %s" % error_line)
                     c = conn.cursor()
                     c.execute("""INSERT INTO autostar DEFAULT VALUES""")
-                    error_line.autostar_id = c.lastrowid
-                    assert error_line.autostar_id is not None
-                    assert error_line.row_id is not None
-                    c.execute("""UPDATE errors SET autostar_id = ? WHERE id = ?""",
-                              (error_line.autostar_id, error_line.row_id))
                     conn.commit()
+                    error_line.set(conn, "autostar_id", c.lastrowid)
             if found_new_matches:
                 for rematch_job in all_failed_jobs:
                     logger.debug(rematch_job)
                     if rematch_job == job:
                         continue
-                    logger.debug("Trying rematch on job %i (%s)" % (rematch_job.id, rematch_job.data['ref_data_name']))
-                    match_errors(get_matchers(conn), rematch_job)
-                    insert_matches(conn, rematch_job)
+                    logger.debug("Trying rematch on job %i (%s)" % (rematch_job.id, rematch_job.ref_data_name))
+                    match_errors(conn, get_matchers(), rematch_job)
+
 
 def job_errors_processed(conn, job):
     c = conn.cursor()
     c.execute("""SELECT errors_processed FROM jobs WHERE id = ?""",
               (job.id,))
     return bool(c.fetchone()[0])
+
 
 def load_error_lines(conn, job):
     c = conn.cursor()
@@ -397,16 +438,14 @@ def load_error_lines(conn, job):
         rv.append(error_line)
     return rv
 
-def process_errors(conn, job):
-    if not job_errors_processed(conn, job):
-        job.error_lines = get_error_lines(job.error_url)
-        insert_errors(conn, job)
-        job.success = False
-    else:
-        job.success = False
-        job.error_lines = load_error_lines(conn, job)
-    match_errors(get_matchers(conn), job)
-    insert_matches(conn, job)
+
+def process_errors(conn, jobs):
+    jobs_by_ref_type = by_ref_type(jobs)
+    for job_type, ref_type_jobs in jobs_by_ref_type.iteritems():
+        for job in ref_type_jobs:
+            if not job.errors_processed and job.error_lines:
+                logger.info("matching errors job %s (%s)" % (job.id, job_type))
+                match_errors(conn, get_matchers(), job)
 
 
 def update_meta(conn, new_last_rev):
@@ -414,45 +453,66 @@ def update_meta(conn, new_last_rev):
     c.execute("""UPDATE meta SET last_revision_id = ?""", (new_last_rev,))
     conn.commit()
 
+
 def parser():
     parser = argparse.ArgumentParser()
     parser.add_argument("--setup", nargs=2, help="Recreate the database from scratch. Takes two arguments, a")
+    parser.add_argument("--db-name", action="store", default="star.db", help="Name of the database file to use.")
+    parser.add_argument("--repository", action="store", help="Repository to run against")
+    parser.add_argument("--rev", action="append", help="Revision id to use")
     mozlog.commandline.add_logging_group(parser)
     return parser
+
+
+def load_treeherder_data(conn, repository, revisions, load_all_after):
+    client = thclient.TreeherderClient()
+    result_sets = get_result_sets(client, repository, revisions, load_all_after)
+    #Process from oldest to newest
+    for result_set in reversed(result_sets):
+        #First insert any new data
+        logger.info("processing result set for revision %s" % result_set['revision'])
+        finished_jobs = get_finished_jobs(client, repository, result_set)
+        new_jobs = get_new_jobs(conn, finished_jobs)
+        error_urls = get_error_urls(client, repository, new_jobs)
+        error_lines = get_error_lines(client, error_urls)
+        insert_jobs(conn, result_set["id"], new_jobs, error_lines)
+    return result_sets
+
 
 def main():
     global logger
     args = parser().parse_args()
     logger = mozlog.commandline.setup_logging("autostar", args, {"mach": sys.stdout})
-    client = thclient.TreeherderClient()
-    conn = sqlite3.connect("star.db")
-    try:
+
+    with sqlite3.Connection(args.db_name) as conn:
         if args.setup:
             setup_database(conn, *args.setup)
             return
 
         repository, last_rev = get_meta(conn)
-        result_sets = get_result_sets(client, repository, last_rev)
-        #Process from oldest to newest
-        for result_set in reversed(result_sets):
-            logger.info("processing result set for revision %s" % result_set['revision'])
-            jobs_by_type = get_job_types_with_errors(client, repository, result_set)
-            for job_type, jobs in jobs_by_type.iteritems():
-                insert_jobs(conn, jobs)
-                for job in jobs:
-                    if job.error_url:
-                        logger.info("processing job %s (%s) errors" % (job.id, job_type))
-                        process_errors(conn, job)
-                    else:
-                        job.success = True
 
-        some_failed = {key:value for key, value in jobs_by_type.iteritems()
-                       if not all(item.success for item in value)}
-        add_new_intermittents(conn, some_failed)
-        if repository != "try":
-            update_meta(conn, result_sets[0]["revision"])
-    finally:
-        conn.close()
+        if args.repository is not None:
+            repository = args.repository
+        load_all_after = repository != "try"
+        if args.rev:
+            revisions = args.revisions
+            load_all_after = False
+        else:
+            revisions = [last_rev]
+
+        result_sets = load_treeherder_data(conn, repository, revisions, load_all_after)
+
+        all_jobs = []
+        for result_set in reversed(result_sets):
+            jobs = load_jobs(conn, result_set["id"])
+            all_jobs.extend(jobs)
+            process_errors(conn, jobs)
+
+        add_new_intermittents(conn, all_jobs)
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception:
+        import pdb
+        pdb.post_mortem()
